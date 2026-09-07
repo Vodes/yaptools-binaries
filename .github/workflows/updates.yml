@@ -17,15 +17,15 @@ jobs:
       matrix:
         package: [fdkaac, flac, opus-tools, ffmpeg, mkvtoolnix, x265]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           ref: main
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v10.0.1
       - name: Resolve updates
         env:
           PACKAGE: ${{ matrix.package }}
         run: uv run --frozen muxtools-build updates --package "$PACKAGE" --apply
-      - uses: peter-evans/create-pull-request@v7
+      - uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         id: pr
         with:
           branch: updates/${{ matrix.package }}
