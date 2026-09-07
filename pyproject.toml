@@ -1,0 +1,56 @@
+[project]
+name = "muxtools-binaries"
+version = "0.2.0"
+description = "Pinned portable binary builds and explicit releases"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx2>=2,<3",
+    "py-cpuinfo2>=10,<11",
+    "pydantic>=2.11,<3",
+    "tomli-w>=1.2,<2",
+    "zstandard>=0.23,<1",
+    "py7zr>=1,<2",
+    "packaging>=25",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.17.1",
+    "ruff>=0.12",
+    "pytest>=8,<10",
+]
+
+[project.scripts]
+muxtools-build = "muxtools_binaries.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.8.5,<0.9"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.mypy]
+local_partial_types = true
+allow_redefinition_new = true
+files = ["src", "tests", "builder", "packages"]
+explicit_package_bases = true
+mypy_path = ["$MYPY_CONFIG_FILE_DIR/src", "$MYPY_CONFIG_FILE_DIR/stubs"]
+
+[tool.ruff]
+line-length = 120
+indent-width = 4
+target-version = "py312"
+extend-exclude = ["context"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+docstring-code-format = false
