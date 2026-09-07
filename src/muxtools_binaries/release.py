@@ -11,14 +11,15 @@ import httpx2
 from .artifacts import read_metadata
 from .build import builder_image
 from .io import extract, sha256
-from .models import load_packages
+from .models import Package, load_packages
 
 
 def release_allowed(event: str, ref: str, publish: bool) -> bool:
     return event == "workflow_dispatch" and ref == "refs/heads/main" and publish is True
 
 
-type ReleaseArtifacts = dict[str, dict[str, tuple[Path, dict[str, Any], str]]]
+type TargetArtifacts = dict[str, tuple[Path, dict[str, Any], str]]
+type ReleaseArtifacts = dict[str, TargetArtifacts]
 
 
 def release_assets(github: "GitHub", release: dict[str, Any]) -> list[dict[str, Any]]:
@@ -103,6 +104,45 @@ class GitHub:
             raise ValueError(f"Upload verification failed: {path.name}")
 
 
+def _validate_package(data: dict[str, Any], package: Package) -> None:
+    if data["provenance"]["type"] != package.type:
+        raise ValueError("Artifact provenance differs from package definition")
+    if package.source and data.get("source") != package.source.model_dump():
+        raise ValueError("Artifact source differs from package definition")
+    if data.get("dependencies", {}) != {name: source.model_dump() for name, source in package.dependencies.items()}:
+        raise ValueError("Artifact dependencies differ from package definition")
+    if (data["version"], data["version_code"]) != (package.version, package.version_code):
+        raise ValueError("Artifact does not match desired version")
+    if data["binaries"] != package.binaries(data["target"]):
+        raise ValueError("Artifact executable mapping differs from package definition")
+
+
+def _validate_target(data: dict[str, Any], package: Package) -> None:
+    config = package.targets[data["target"]]
+    if data["smoke"] != package.executables:
+        raise ValueError("Artifact smoke commands differ from package definition")
+    if config.asset and data["provenance"].get("asset") != config.asset.model_dump():
+        raise ValueError("Artifact import differs from package definition")
+    expected_runtime = config.runtime.model_dump(exclude_defaults=True) if data["target"].startswith("linux") else {}
+    if data.get("runtime", {}) != expected_runtime:
+        raise ValueError("Artifact runtime differs from package definition")
+    if package.type == "source-build":
+        for key in ("compiler", "lto", "cpu_levels", "extra_cflags", "extra_cxxflags", "extra_ldflags"):
+            if data.get("build", {}).get(key) != getattr(config, key):
+                raise ValueError(f"Artifact build setting differs from package definition: {key}")
+
+
+def _require_native_report(artifacts: Path, archive: Path, digest: str, package: Package, target: str) -> None:
+    reports = [json.loads(path.read_text()) for path in artifacts.rglob(archive.name + ".report.json")]
+    required = {"structure", "smoke", *[f"run:{name}:baseline" for name in package.executables]}
+    native_os = "nt" if target.startswith("windows") else "posix"
+    if not any(
+        report.get("sha256") == digest and required <= set(report.get("checks", [])) and report.get("os") == native_os
+        for report in reports
+    ):
+        raise ValueError(f"Missing native smoke report: {archive.name}")
+
+
 def collect(root: Path, artifacts: Path) -> ReleaseArtifacts:
     packages = load_packages(root)
     groups: ReleaseArtifacts = {}
@@ -115,44 +155,13 @@ def collect(root: Path, artifacts: Path) -> ReleaseArtifacts:
         if data["provenance"]["channel"] != "release":
             raise ValueError(f"Not a release artifact: {archive.name}")
         package = packages[data["name"]]
-        if data["provenance"]["type"] != package.type:
-            raise ValueError("Artifact provenance differs from package definition")
-        if package.source and data.get("source") != package.source.model_dump():
-            raise ValueError("Artifact source differs from package definition")
-        if data.get("dependencies", {}) != {name: source.model_dump() for name, source in package.dependencies.items()}:
-            raise ValueError("Artifact dependencies differ from package definition")
-        if (data["version"], data["version_code"]) != (package.version, package.version_code):
-            raise ValueError("Artifact does not match desired version")
-        if data["binaries"] != package.binaries(data["target"]):
-            raise ValueError("Artifact executable mapping differs from package definition")
+        _validate_package(data, package)
         if data["builder"]["revision"] != os.environ["GITHUB_SHA"] or data["builder"]["image"] != builder_image(
             root, release=True
         ):
             raise ValueError("Artifact revision or builder is not eligible for publishing")
-        config = package.targets[data["target"]]
-        if data["smoke"] != package.executables:
-            raise ValueError("Artifact smoke commands differ from package definition")
-        if config.asset and data["provenance"].get("asset") != config.asset.model_dump():
-            raise ValueError("Artifact import differs from package definition")
-        expected_runtime = (
-            config.runtime.model_dump(exclude_defaults=True) if data["target"].startswith("linux") else {}
-        )
-        if data.get("runtime", {}) != expected_runtime:
-            raise ValueError("Artifact runtime differs from package definition")
-        if package.type == "source-build":
-            for key in ("compiler", "lto", "cpu_levels", "extra_cflags", "extra_cxxflags", "extra_ldflags"):
-                if data.get("build", {}).get(key) != getattr(config, key):
-                    raise ValueError(f"Artifact build setting differs from package definition: {key}")
-        reports = [json.loads(path.read_text()) for path in artifacts.rglob(archive.name + ".report.json")]
-        required = {"structure", "smoke", *[f"run:{name}:baseline" for name in package.executables]}
-        native_os = "nt" if data["target"].startswith("windows") else "posix"
-        if not reports or not any(
-            report.get("sha256") == digest
-            and required <= set(report.get("checks", []))
-            and report.get("os") == native_os
-            for report in reports
-        ):
-            raise ValueError(f"Missing native smoke report: {archive.name}")
+        _validate_target(data, package)
+        _require_native_report(artifacts, archive, digest, package, data["target"])
         group = groups.setdefault(package.name, {})
         if data["target"] in group:
             raise ValueError("Duplicate target artifact")
@@ -165,12 +174,7 @@ def collect(root: Path, artifacts: Path) -> ReleaseArtifacts:
     return groups
 
 
-def publish(root: Path, artifacts: Path, repository: str, enabled: bool) -> None:
-    if not release_allowed(os.getenv("GITHUB_EVENT_NAME", ""), os.getenv("GITHUB_REF", ""), enabled):
-        raise ValueError("Publishing requires manual dispatch on main with publish enabled")
-    groups = collect(root, artifacts)
-    github = GitHub(repository)
-    catalog_release = github.release("catalog-v1")
+def _load_catalog(github: GitHub, catalog_release: dict[str, Any] | None) -> dict[str, Any]:
     catalog: dict[str, Any] = {"schema_version": 1, "packages": {}}
     if catalog_release:
         assets = release_assets(github, catalog_release)
@@ -183,6 +187,36 @@ def publish(root: Path, artifacts: Path, repository: str, enabled: bool) -> None
                 catalog = json.loads(github.asset_bytes(snapshots[-1]))
     if catalog.get("schema_version") != 1:
         raise ValueError("Unsupported catalog schema")
+    return catalog
+
+
+def _publish_draft(github: GitHub, release: dict[str, Any]) -> None:
+    if release["draft"]:
+        github.request("PATCH", f"/releases/{release['id']}", json={"draft": False, "make_latest": "false"})
+
+
+def _publish_package(github: GitHub, repository: str, name: str, targets: TargetArtifacts) -> dict[str, Any]:
+    sample = next(iter(targets.values()))[1]
+    tag = f"{name}-{sample['version']}"
+    release = github.ensure_release(tag, sample["builder"]["revision"])
+    entry = {"version": sample["version"], "version_code": sample["version_code"], "tag": tag, "targets": {}}
+    for target, (archive, data, digest) in targets.items():
+        checksum = archive.with_name(archive.name + ".sha256")
+        checksum.write_text(f"{digest}  {archive.name}\n")
+        github.upload(release, archive)
+        github.upload(release, checksum)
+        entry["targets"][target] = {
+            "url": f"https://github.com/{repository}/releases/download/{tag}/{archive.name}",
+            "sha256": digest,
+            "size": archive.stat().st_size,
+            "binaries": data["binaries"],
+            "runtime": data.get("runtime", {}),
+        }
+    _publish_draft(github, release)
+    return entry
+
+
+def _update_catalog(github: GitHub, repository: str, catalog: dict[str, Any], groups: ReleaseArtifacts) -> None:
     for name, targets in groups.items():
         sample = next(iter(targets.values()))[1]
         version = sample["version"]
@@ -192,23 +226,7 @@ def publish(root: Path, artifacts: Path, repository: str, enabled: bool) -> None
             sample["version_code"] <= entry["version_code"] for entry in versions.values()
         ):
             raise ValueError(f"Version code for {name} must exceed its published version codes")
-        tag = f"{name}-{version}"
-        release = github.ensure_release(tag, sample["builder"]["revision"])
-        entry = {"version": sample["version"], "version_code": sample["version_code"], "tag": tag, "targets": {}}
-        for target, (archive, data, digest) in targets.items():
-            checksum = archive.with_name(archive.name + ".sha256")
-            checksum.write_text(f"{digest}  {archive.name}\n")
-            github.upload(release, archive)
-            github.upload(release, checksum)
-            entry["targets"][target] = {
-                "url": f"https://github.com/{repository}/releases/download/{tag}/{archive.name}",
-                "sha256": digest,
-                "size": archive.stat().st_size,
-                "binaries": data["binaries"],
-                "runtime": data.get("runtime", {}),
-            }
-        if release["draft"]:
-            github.request("PATCH", f"/releases/{release['id']}", json={"draft": False, "make_latest": "false"})
+        entry = _publish_package(github, repository, name, targets)
         if version in versions and versions[version] != entry:
             raise ValueError("Conflicting catalog identity")
         versions[version] = entry
@@ -216,7 +234,9 @@ def publish(root: Path, artifacts: Path, repository: str, enabled: bool) -> None
         package_entry["provides"] = sorted(
             {binary for target in latest["targets"].values() for binary in target["binaries"]}
         )
-    catalog_release = catalog_release or github.ensure_release("catalog-v1", os.environ["GITHUB_SHA"])
+
+
+def _publish_catalog(github: GitHub, catalog_release: dict[str, Any], catalog: dict[str, Any]) -> None:
     with tempfile.TemporaryDirectory() as temporary:
         directory = Path(temporary)
         payload = json.dumps(catalog, indent=2, sort_keys=True) + "\n"
@@ -230,15 +250,23 @@ def publish(root: Path, artifacts: Path, repository: str, enabled: bool) -> None
         assets = release_assets(github, catalog_release)
         current = next((a for a in assets if a["name"] == "versions.json"), None)
         if current and github.asset_bytes(current).decode() == payload:
-            if catalog_release["draft"]:
-                github.request(
-                    "PATCH", f"/releases/{catalog_release['id']}", json={"draft": False, "make_latest": "false"}
-                )
+            _publish_draft(github, catalog_release)
             return
         if current:
             github.request("DELETE", f"/releases/assets/{current['id']}")
         pointer = directory / "versions.json"
         pointer.write_text(payload)
         github.upload(upload_release, pointer)
-        if catalog_release["draft"]:
-            github.request("PATCH", f"/releases/{catalog_release['id']}", json={"draft": False, "make_latest": "false"})
+        _publish_draft(github, catalog_release)
+
+
+def publish(root: Path, artifacts: Path, repository: str, enabled: bool) -> None:
+    if not release_allowed(os.getenv("GITHUB_EVENT_NAME", ""), os.getenv("GITHUB_REF", ""), enabled):
+        raise ValueError("Publishing requires manual dispatch on main with publish enabled")
+    groups = collect(root, artifacts)
+    github = GitHub(repository)
+    catalog_release = github.release("catalog-v1")
+    catalog = _load_catalog(github, catalog_release)
+    _update_catalog(github, repository, catalog, groups)
+    catalog_release = catalog_release or github.ensure_release("catalog-v1", os.environ["GITHUB_SHA"])
+    _publish_catalog(github, catalog_release, catalog)

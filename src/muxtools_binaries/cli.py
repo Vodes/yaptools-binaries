@@ -14,7 +14,7 @@ from .models import load_packages
 from .testing import structural, test_archive
 
 
-def main() -> int:
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="muxtools-build")
     parser.add_argument("--root", type=Path, default=Path.cwd())
     commands = parser.add_subparsers(dest="command", required=True)
@@ -44,7 +44,93 @@ def main() -> int:
     updates = commands.add_parser("updates")
     updates.add_argument("--package")
     updates.add_argument("--apply", action="store_true")
-    args = parser.parse_args()
+    return parser
+
+
+def _matrix(root: Path, names: str, changed_from: str | None) -> dict[str, list[dict[str, str]]]:
+    packages = load_packages(root, names.split(",") if names else None)
+    if changed_from and not names:
+        result = subprocess.run(
+            ["git", "diff", "--name-only", changed_from, "HEAD"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        paths = result.stdout.splitlines()
+        if paths and all(path.startswith("packages/") for path in paths):
+            changed = {path.split("/")[1] for path in paths}
+            packages = {name: pkg for name, pkg in packages.items() if name in changed}
+    return {
+        "include": [
+            {
+                "package": p.name,
+                "target": target,
+                "runner": "windows-2022" if target.startswith("windows") else "ubuntu-24.04",
+            }
+            for p in packages.values()
+            for target in p.targets
+        ]
+    }
+
+
+def _build_in_container(root: Path, args: argparse.Namespace, image: str, revision: str) -> None:
+    user: list[str] = []
+    if sys.platform != "win32":
+        user = ["--user", f"{os.getuid()}:{os.getgid()}"]
+    run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            *user,
+            "-v",
+            f"{root}:/work",
+            "-w",
+            "/work",
+            "-e",
+            "UV_PROJECT_ENVIRONMENT=/tmp/muxtools-venv",
+            "-e",
+            "UV_CACHE_DIR=/tmp/uv-cache",
+            image,
+            "uv",
+            "run",
+            "--frozen",
+            "muxtools-build",
+            "build",
+            args.package,
+            "--inside",
+            "--target",
+            args.target,
+            "--image",
+            image,
+            "--revision",
+            revision,
+            "--channel",
+            args.channel,
+            "--jobs",
+            args.jobs,
+        ]
+    )
+
+
+def _build(root: Path, args: argparse.Namespace) -> None:
+    package = load_packages(root, [args.package])[args.package]
+    if args.target not in package.targets:
+        raise ValueError(f"Unsupported target for {package.name}: {args.target}")
+    image = builder_image(root, args.image, args.channel == "release")
+    revision = args.revision or subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+    if not args.inside:
+        _build_in_container(root, args, image, revision)
+    else:
+        stage, _ = produce(root, package, args.target, args.jobs)
+        data = metadata(package, args.target, revision, image, args.channel)
+        structural(stage, data)
+        print(pack(stage, data, root / "dist"))
+
+
+def main() -> int:
+    args = _parser().parse_args()
     root = args.root.resolve()
     try:
         if args.command == "validate":
@@ -55,85 +141,9 @@ def main() -> int:
             structural(args.stage, data)
             print(pack(args.stage, data, args.output))
         elif args.command == "matrix":
-            packages = load_packages(root, args.packages.split(",") if args.packages else None)
-            if args.changed_from and not args.packages:
-                result = subprocess.run(
-                    ["git", "diff", "--name-only", args.changed_from, "HEAD"],
-                    cwd=root,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-                paths = result.stdout.splitlines()
-                if paths and all(path.startswith("packages/") for path in paths):
-                    changed = {path.split("/")[1] for path in paths}
-                    packages = {name: pkg for name, pkg in packages.items() if name in changed}
-            print(
-                json.dumps(
-                    {
-                        "include": [
-                            {
-                                "package": p.name,
-                                "target": target,
-                                "runner": "windows-2022" if target.startswith("windows") else "ubuntu-24.04",
-                            }
-                            for p in packages.values()
-                            for target in p.targets
-                        ]
-                    }
-                )
-            )
+            print(json.dumps(_matrix(root, args.packages, args.changed_from)))
         elif args.command == "build":
-            package = load_packages(root, [args.package])[args.package]
-            if args.target not in package.targets:
-                raise ValueError(f"Unsupported target for {package.name}: {args.target}")
-            image = builder_image(root, args.image, args.channel == "release")
-            revision = (
-                args.revision or subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
-            )
-            if not args.inside:
-                user: list[str] = []
-                if sys.platform != "win32":
-                    user = ["--user", f"{os.getuid()}:{os.getgid()}"]
-                command = [
-                    "docker",
-                    "run",
-                    "--rm",
-                    *user,
-                    "-v",
-                    f"{root}:/work",
-                    "-w",
-                    "/work",
-                    "-e",
-                    "UV_PROJECT_ENVIRONMENT=/tmp/muxtools-venv",
-                    "-e",
-                    "UV_CACHE_DIR=/tmp/uv-cache",
-                    image,
-                    "uv",
-                    "run",
-                    "--frozen",
-                    "muxtools-build",
-                    "build",
-                    package.name,
-                    "--inside",
-                    "--target",
-                    args.target,
-                    "--image",
-                    image,
-                    "--revision",
-                    revision,
-                    "--channel",
-                    args.channel,
-                    "--jobs",
-                    args.jobs,
-                ]
-                run(command)
-            else:
-                stage, _ = produce(root, package, args.target, args.jobs)
-                data = metadata(package, args.target, revision, image, args.channel)
-                structural(stage, data)
-                archive = pack(stage, data, root / "dist")
-                print(archive)
+            _build(root, args)
         elif args.command == "test":
             print(test_archive(args.archive.resolve(), smoke=not args.structural_only, report=args.report))
         elif args.command == "publish":
